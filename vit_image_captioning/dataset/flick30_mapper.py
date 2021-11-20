@@ -18,13 +18,10 @@ class Flickr30kMapFileReader():
 
     with open(tokens_filepath, 'r') as fin:          
           for line in fin:
-            try:
-              img_id,line = self.__get_line_first_element_split(line,"#")
-              img_example,line = self.__get_line_first_element_split(line,"\t")
-              caption = line.replace("\n","")
-              #caption,line = self.__get_line_first_element_split(line,"#")
-            except:
-              import pdb;pdb.set_trace()
+            img_id,line = self.__get_line_first_element_split(line,"#")
+            img_id,_ = img_id.split(".jpg")
+            img_example,line = self.__get_line_first_element_split(line,"\t")
+            caption = line.replace("\n","")
 
             img_id_list.append(img_id)
             img_example_list.append(img_example)
@@ -38,6 +35,7 @@ class Flickr30kMapFileReader():
     df = pd.DataFrame.from_dict(df_dict)
     return df
 
+    
 if __name__ == '__main__':
     tokens_filepath = "/content/data/flickr30k/results_20130124.token"
     flickr30k_mapfile_reader = Flickr30kMapFileReader(tokens_filepath)
