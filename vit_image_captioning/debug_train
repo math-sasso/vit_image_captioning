@@ -1,0 +1,33 @@
+import torch
+import pytorch_lightning as pl
+from data.data_module import MyDataModule
+from model.caption_model import CaptionModel
+from configs import configs
+
+data_module = MyDataModule(configs)
+
+import pdb;pdb.set_trace()
+debug_model = CaptionModel(
+    hparams = configs
+)
+
+debug_trainer = pl.Trainer(
+    fast_dev_run=True,
+    overfit_batches=1,
+    gpus=1,
+    log_gpu_memory=True,
+    max_epochs=5,
+    # profiler=True,
+    progress_bar_refresh_rate=25,
+    checkpoint_callback=False,
+    logger=False
+)
+
+debug_trainer.fit(
+    debug_model,
+    train_dataloader=data_module.val_dataloader(),
+    val_dataloaders=data_module.val_dataloader()
+)
+
+del debug_model, debug_trainer
+torch.cuda.empty_cache()
