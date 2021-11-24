@@ -1,6 +1,9 @@
+import timm
+import torch
+import random
 import torch.nn as nn
 import pytorch_lightning as pl
-from transformers import T5ForConditionalGeneration
+from transformers import T5Tokenizer, T5ForConditionalGeneration
 import sacrebleu
 
 class CaptionModel(pl.LightningModule):
@@ -8,34 +11,42 @@ class CaptionModel(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(hparams)
         # Initializes Decoder + LM Head
-        self.t5 = T5ForConditionalGeneration.from_pretrained(self.hparams.t5_prefix)
-        
-        self.vit = timm.create_model('vit_base_patch16_224', pretrained=True,
+
+        self.t5 = T5ForConditionalGeneration.from_pretrained(self.hparams["model_config"]["t5_prefix"])
+        self.vit = timm.create_model(self.hparams["model_config"]["vit_prefix"], pretrained=True,
                                      representation_size=768)
 
-        # Maches dimensions between EfficientNet and T5
-        # self.effnet_to_t5_bridge = nn.Conv2d(
-        #     in_channels=1280, out_channels=self.t5.model_dim, kernel_size=1)
-                
-        # Não está passando tokenizer pro Cuda quando usa o hparams
-        self.tokenizer = T5Tokenizer.from_pretrained(self.hparams.t5_prefix)
+        self.tokenizer = T5Tokenizer.from_pretrained(self.hparams["model_config"]["t5_prefix"])
 
         self.maybe_freeze_params()
 
+
+    def get_vit_features(self, x):
+        # O que fazer com o cls token?
+        x = self.vit.patch_embed(x)
+        cls_token = self.vit.cls_token.expand(x.shape[0], -1, -1)  # stole cls_tokens impl from Phil Wang, thanks
+        if self.vit.dist_token is None:
+            x = torch.cat((cls_token, x), dim=1)
+        else:
+            x = torch.cat((cls_token, self.vit.dist_token.expand(x.shape[0], -1, -1), x), dim=1)
+        x = self.vit.pos_drop(x + self.vit.pos_embed)
+        x = self.vit.blocks(x)
+        x = self.vit.norm(x)
+        return self.vit.pre_logits(x)
 
     def maybe_freeze_params(self):
         """Optionally freezes params.
 
         """
         # Encoder T5
-        if self.hparams.freeze_t5_encoder:
+        if self.hparams["freeze_conditions"]["freeze_t5_encoder"]:
             print("Freezing params for t5 encoder:")
             for name, param  in self.t5.encoder.named_parameters():
                 if name not in ['shared.weight', 'embed_tokens.weight']:
                     # logging.debug(f'\t{name}')
                     param.requires_grad = False
         # T5 decoder
-        if self.hparams.freeze_t5_decoder:
+        if self.hparams["freeze_conditions"]["freeze_t5_decoder"]:
             print("Freezing params for t5 decoder:")
             for name, param  in self.t5.decoder.named_parameters():
                 if name not in ['shared.weight', 'embed_tokens.weight']:
@@ -43,12 +54,12 @@ class CaptionModel(pl.LightningModule):
                     param.requires_grad = False
 
         # Embeddings T5
-        if self.hparams.freeze_t5_embeddings:
+        if self.hparams["freeze_conditions"]["freeze_t5_embeddings"]:
             print(f'Freezing t5 embeddings weights')
             self.t5.shared.weight.requires_grad = False
-
+        
         # EfficientNet
-        if self.hparams.freeze_image_encoder:
+        if self.hparams["freeze_conditions"]["freeze_image_encoder"]:
             print("Freezing Image encoder params:")
             for name, param  in self.vit.named_parameters():
                 # logging.debug(f'\t{name}')
@@ -59,7 +70,7 @@ class CaptionModel(pl.LightningModule):
         """Encodes image and matches dimension to T5 embeddings.
         
         """
-        return get_vit_features(self.vit, input_image)
+        return self.get_vit_features(input_image)
 
     def forward(
         self,
@@ -79,7 +90,7 @@ class CaptionModel(pl.LightningModule):
 
         # Obs.: input_embeds are only used on encoder if encoder_outputs is None
         output = self.t5(
-            encoder_outputs=None if self.hparams.use_t5_encoder else (input_embeds,),
+            encoder_outputs=None if self.hparams["model_config"]["use_t5_encoder"] else (input_embeds,),
             inputs_embeds=input_embeds,
             labels = labels,
             return_dict=True,
@@ -164,23 +175,24 @@ class CaptionModel(pl.LightningModule):
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(
             [p for p in self.parameters() if p.requires_grad],
-            lr=self.hparams.learning_rate, eps=1e-08
+            lr=self.hparams["model_config"]["learning_rate"], eps=1e-08
             )
         return optimizer
 
     def _base_eval_step(self, batch):
         """Base function for eval/test steps.
         """
-        true_captions = batch['raw_captions']
+        true_captions = batch['target_caption']
 
         generated_tokens = self.greedy_generate(
-            input_image=batch['transformed_image'],
-            max_length=self.hparams.max_tokens_captions_gen,
-            use_t5_encoder=self.hparams.use_t5_encoder
+            input_image=batch['transformed_image_tensor'],
+            max_length=self.hparams["captions_config"]["max_tokens_captions"],
+            use_t5_encoder=self.hparams["model_config"]["use_t5_encoder"]
         )
         generated_text = self.decode_token_ids(generated_tokens)
         rets = {'trues': true_captions,'preds': generated_text}
         return rets
+
     
     def _base_eval_epoch_end(self, outputs, prefix):
         """Base function for eval/test epoch ends.
@@ -218,12 +230,14 @@ class CaptionModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         labels = batch['tokenized_target_caption']
         loss = self(
-            use_t5_encoder=self.hparams.use_t5_encoder, 
-            input_image=batch['transformed_image'],
+            use_t5_encoder=self.hparams["model_config"]["use_t5_encoder"], 
+            input_image=batch['transformed_image_tensor'],
             labels=labels.masked_fill(labels == 0, -100),
             )['loss']
 
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
+        #self.hparams["run"]["train_loss"] = loss
+
         return loss
 
     def validation_step(self, batch, batch_idx):        
@@ -238,9 +252,12 @@ class CaptionModel(pl.LightningModule):
         output = self._base_eval_epoch_end(outputs, 'val')
         for k,v in output.items():
             self.log(k, v, prog_bar=True)
+            #self.hparams["run"][k] = v
 
     def test_epoch_end(self,outputs):
         output = self._base_eval_epoch_end(outputs, 'test')
         for k,v in output.items():
             self.log(k, v, prog_bar=True)
+            #self.hparams["run"][k] = v
+
         return output
